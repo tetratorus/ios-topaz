@@ -176,6 +176,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0127–0128 | `sweetbusy=N`; no IOKit-daemon busy hold (IOKit never quiesced, wifid hung boot) |
 | 0131–0137, 0139 | `SweetSurface` for CoreAnimation's GL renderer: real values / bulk attachments / purgeability, wrapped client image and memory, `IOSurfaceAddress` surfaces, detach/release protocol |
 | 0138 | Empty `IOAcceleratorES` service |
+| 0140 | QEMU only: virtio-mmio network driver (`sweetvnet=1`) registered as Ethernet `en0`, with BPF so DHCP works |
 
 ## Key hardware facts (topaz)
 
