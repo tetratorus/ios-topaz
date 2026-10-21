@@ -1,5 +1,11 @@
 # iOS 16 on sweet (Redmi Note 10 Pro, SM7150) - working notes
 
+## QEMU + network + test app (2026-10-21, Devin)
+- Patch **0127** (`xnu/patches/0127-qemu-virtio-net.patch`): polled virtio-mmio v2 net driver (`bsd/dev/sweet_vnet.c`, boot-arg `sweetvnet=1`) + IOKit `IOEthernetInterface` registration (`iokit/Kernel/arm/SweetNet.cpp`) so configd sees `en0`; `bpfattach` + bpf taps are required (ipconfigd sends DHCP through BPF; without it only IPv6 RS/mDNS went out). Built on macOS with Xcode 15.4 (Xcode 16+ iig ABI breaks this tree).
+- QEMU: `-global virtio-mmio.force-legacy=false -netdev user,id=n0,net=10.0.2.0/24,dns=10.0.2.3 -device virtio-net-device,netdev=n0,mac=02:54:4f:50:41:5c` on `virt,gic-version=3`, cortex-a76, 4 vCPU (MPIDR 0x100-0x103).
+- Observed (run r20): DHCP ACK 10.0.2.15 ~60 s after boot, DNS via 10.0.2.3, HTTPS to Apple servers, lock screen shows network time. Built-in test app `/Applications/TopazTest.app` (ad-hoc signed, platform-application entitlement; sweet AMFI makes rootfs binaries platform) appears on the home screen, opens, shows en0 10.0.2.15, DNS for example.com, HTTP GET http://example.com/ status 200. HTTPS: TLS handshake seen in pcap, result line not visible on screen (layout cut-off), unverified.
+- Touch: boot with `sweethidtest=20` (timer stops after 60 fires); attach the GDB touch daemon early.
+
 ## Agent handoff / active work (2026-10-15, latest)
 
 ### >>> UPDATE 2026-10-18 (read first, then the 10-17 handoff below) <<<
