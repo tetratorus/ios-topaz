@@ -1,0 +1,95 @@
+#!/usr/bin/env python3
+"""iosctl: simctl-style control of the QEMU iOS phone (viewer http://localhost:8099, guest agent topazd via localhost:7777).
+
+  iosctl tap X Y                  touch coordinates are phone pixels, 1080 x 2400
+  iosctl swipe X1 Y1 X2 Y2 [MS]
+  iosctl type "text"              hardware-keyboard typing into the focused field
+  iosctl key QCODE [MODS]         e.g. key ret | key a meta_l (QEMU qcodes)
+  iosctl home | unlock
+  iosctl screenshot [FILE.png]
+  iosctl save [FILE]              save the running phone (default snaps/home.mig, what start.sh restores)
+  iosctl install PATH             PATH = Foo.app dir, .ipa or .zip containing Foo.app; ad-hoc signed with ldid, no reboot
+  iosctl launch BUNDLE_ID | terminate BUNDLE_ID | uninstall BUNDLE_ID
+  iosctl openurl URL | apps | ping
+  iosctl log [N]                  last N kernel log lines
+"""
+import time, io, os, subprocess, sys, tarfile, tempfile, urllib.parse, urllib.request, zipfile, plistlib, shutil
+V = os.environ.get('IOS_VIEWER', 'http://localhost:8099'); A = os.environ.get('IOS_AGENT', 'http://localhost:7777')
+LDID = shutil.which('ldid') or os.path.expanduser('~/bin/ldid')
+def launch(bid, tries=12):
+    for i in range(tries):
+        try:
+            return get(A, '/launch', bundle=bid).decode().strip()
+        except SystemExit as e:
+            if i == tries - 1 or 'returned nil' not in str(e): raise
+            time.sleep(5)
+
+def get(base, path, timeout=60, data=None, **q):
+    u = f'{base}{path}' + ('?' + urllib.parse.urlencode(q) if q else '')
+    try:
+        with urllib.request.urlopen(urllib.request.Request(u, data=data, method='POST' if data is not None else 'GET'), timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        sys.exit(f'{path}: HTTP {e.code}: {e.read().decode(errors="replace").strip()}')
+    except OSError as e:
+        sys.exit(f'{u}: {e} (is the phone running? guest agent needs ~1 min after boot for the network)')
+def macho(p):
+    with open(p, 'rb') as f: m = f.read(4)
+    return m in (b'\xcf\xfa\xed\xfe', b'\xca\xfe\xba\xbe')
+def sign(app):
+    for root, _, files in os.walk(app):
+        for fn in files:
+            p = os.path.join(root, fn)
+            if os.path.islink(p) or not macho(p): continue
+            ents = subprocess.run([LDID, '-e', p], capture_output=True).stdout
+            if ents.strip():
+                with tempfile.NamedTemporaryFile(suffix='.plist', delete=False) as t: t.write(ents)
+                subprocess.run([LDID, f'-S{t.name}', p], check=True); os.unlink(t.name)
+            else:
+                subprocess.run([LDID, '-S', p], check=True)
+def install(path):
+    tmp = tempfile.mkdtemp()
+    try:
+        if os.path.isdir(path):
+            app = os.path.join(tmp, os.path.basename(path.rstrip('/'))); shutil.copytree(path, app, symlinks=True)
+        else:
+            zipfile.ZipFile(path).extractall(tmp)
+            apps = [os.path.join(r, d) for r, ds, _ in os.walk(tmp) for d in ds if d.endswith('.app')]
+            if not apps: sys.exit('no .app inside ' + path)
+            app = min(apps, key=len)
+            for r, _, fs in os.walk(app):   # zip extraction drops the executable bit
+                for f in fs:
+                    p = os.path.join(r, f)
+                    if not os.path.islink(p) and macho(p): os.chmod(p, 0o755)
+        info = plistlib.load(open(os.path.join(app, 'Info.plist'), 'rb'))
+        sign(app)
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode='w', format=tarfile.USTAR_FORMAT) as t: t.add(app, arcname=os.path.basename(app))
+        print(get(A, '/install', timeout=300, data=buf.getvalue()).decode().strip())
+        return info.get('CFBundleIdentifier')
+    finally:
+        shutil.rmtree(tmp)
+def main(a):
+    if not a or a[0] in ('-h', '--help', 'help'): print(__doc__); return
+    c, r = a[0], a[1:]
+    if c == 'tap': get(V, '/tap', x=r[0], y=r[1])
+    elif c == 'swipe': get(V, '/swipe', x1=r[0], y1=r[1], x2=r[2], y2=r[3], ms=r[4] if len(r) > 4 else 300)
+    elif c == 'type': get(V, '/type', text=' '.join(r))
+    elif c == 'key': get(V, '/key', q=r[0], mods=r[1] if len(r) > 1 else '')
+    elif c in ('home', 'unlock'): get(V, '/' + c)
+    elif c == 'screenshot':
+        fn = r[0] if r else 'screenshot.png'; open(fn, 'wb').write(get(V, '/fb.png')); print(fn)
+    elif c == 'save':
+        fn = os.path.abspath(r[0] if r else os.path.expanduser('~/emu/snaps/home.mig'))
+        print(get(V, '/save', timeout=900, file=fn).decode().strip())
+    elif c == 'install':
+        bid = install(r[0])
+        if '--launch' in r: print(launch(bid))
+    elif c == 'launch': print(launch(r[0]))
+    elif c in ('terminate', 'uninstall'): print(get(A, '/' + c, bundle=r[0]).decode().strip())
+    elif c == 'openurl': print(get(A, '/openurl', url=r[0]).decode().strip())
+    elif c in ('apps', 'ping'): print(get(A, '/' + c).decode().strip())
+    elif c == 'log':
+        print('\n'.join(get(V, '/log').decode(errors='replace').splitlines()[-int(r[0] if r else 40):]))
+    else: sys.exit(__doc__)
+main(sys.argv[1:])

@@ -177,6 +177,7 @@ Not in git: partition backups, live device trees, Apple firmware and root images
 | 0131–0137, 0139 | `SweetSurface` for CoreAnimation's GL renderer: real values / bulk attachments / purgeability, wrapped client image and memory, `IOSurfaceAddress` surfaces, detach/release protocol |
 | 0138 | Empty `IOAcceleratorES` service |
 | 0140 | QEMU only: virtio-mmio network driver (`sweetvnet=1`) registered as Ethernet `en0`, with BPF so DHCP works |
+| 0141 | QEMU only: virtio-mmio input driver (`sweetvinput=1`): tablet/multitouch to the touch screen, power/volume/home keys, and a HID keyboard service for typing |
 
 ## Key hardware facts (topaz)
 
