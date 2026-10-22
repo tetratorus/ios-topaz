@@ -157,7 +157,7 @@ f.onpointerdown=e=>{e.preventDefault();f.setPointerCapture(e.pointerId);d=P(e);t
 f.onpointermove=e=>{if(!d||Date.now()-lt<30)return;lt=Date.now();const [x,y]=P(e);tx(`/touch?d=1&x=${x}&y=${y}`)};
 f.onpointerup=e=>{if(!d)return;const [x,y]=P(e);tx(`/touch?d=1&x=${x}&y=${y}`);tx(`/touch?d=0&x=${x}&y=${y}`);d=null;T.textContent=''};
 const KM={Enter:'ret',Backspace:'backspace',Tab:'tab',Escape:'esc',ArrowLeft:'left',ArrowRight:'right',ArrowUp:'up',ArrowDown:'down',Delete:'delete'};
-document.onkeydown=e=>{if(e.target.tagName=='INPUT')return;let u=null;const m=[e.metaKey?'meta_l':'',e.ctrlKey?'ctrl':'',e.altKey?'alt':''].filter(x=>x).join(',');
+document.onkeydown=e=>{if(e.target.tagName=='INPUT')return;if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()=='v')return;let u=null;const m=[e.metaKey?'meta_l':'',e.ctrlKey?'ctrl':'',e.altKey?'alt':''].filter(x=>x).join(',');
 if(KM[e.key])u=`/key?q=${KM[e.key]}&mods=${m}`;else if(e.key.length==1)u=m?`/key?q=${encodeURIComponent(e.key.toLowerCase())}&mods=${m}`:`/type?text=${encodeURIComponent(e.key)}`;
 if(u){e.preventDefault();tx(u);T.textContent='typing'}};
 document.onpaste=e=>{const t=e.clipboardData.getData('text');if(t){e.preventDefault();tx('/type?text='+encodeURIComponent(t))}};
