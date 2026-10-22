@@ -15,7 +15,9 @@ if [ "$1" = --fresh ] || [ ! -f $SNAP ]; then
   # Apple-logo frames are small JPEGs (<20 KB), the home screen is >40 KB: wait for logo, then for home (boot.sh unlocks)
   logo=0; for i in $(seq 1 120); do sleep 10; sz=$(curl -s -m 10 localhost:$PORT/fb.jpg | wc -c)
     if [ "$sz" -gt 1000 ] && [ "$sz" -lt 20000 ]; then logo=1; elif [ $logo = 1 ] && [ "$sz" -gt 40000 ]; then break; fi; done
-  sleep 60; ./iosctl home; sleep 5; ./iosctl save
+  # iOS defaults to Auto-Lock 1 min and unlocking a restored guest is flaky: set Auto-Lock = Never before saving
+  sleep 60; ./iosctl openurl "prefs:root=DISPLAY&path=AUTOLOCK"; sleep 15; ./iosctl tap 200 1209; sleep 5
+  ./iosctl terminate com.apple.Preferences; sleep 3; ./iosctl home; sleep 5; ./iosctl save
 else
   mkdir -p $RUN; t0=$(date +%s)
   QEMU_A76_NOPAN=1 VIRT_MPIDR_OR=0x100 QEMU_PSCI_SMC=1 GDBPORT=1240 nohup python3 emu.py guest12.ram.json $RUN \
