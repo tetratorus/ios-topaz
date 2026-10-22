@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>platform-application</key><true/>
+	<key>com.apple.private.security.no-sandbox</key><true/>
+	<key>com.apple.private.security.no-container</key><true/>
+	<key>com.apple.private.skip-library-validation</key><true/>
+	<key>com.apple.lsapplicationworkspace.rebuildappdatabases</key><true/>
+	<key>com.apple.private.MobileContainerManager.allowed</key><true/>
+	<key>com.apple.private.MobileContainerManager.delete</key><true/>
+	<key>com.apple.private.mobileinstall.allowedSPI</key>
+	<array>
+		<string>InstallForLaunchServices</string>
+		<string>UninstallForLaunchServices</string>
+		<string>Lookup</string>
+	</array>
+	<key>com.apple.private.installcoordinationd.daemon</key><true/>
+	<key>com.apple.private.coreservices.lsaw</key><true/>
+	<key>com.apple.private.coreservices.canmaplsdatabase</key><true/>
+	<key>com.apple.private.coreservices.canmapbundleidtouuid</key><true/>
+	<key>com.apple.private.coreservices.can-perform-rebuild-registration</key><true/>
+	<key>com.apple.private.coreservices.can-register-install-results</key><true/>
+	<key>com.apple.private.coreservices.can-send-install-notifications</key><true/>
+	<key>com.apple.springboard.launchapplications</key><true/>
+	<key>com.apple.springboard.opensensitiveurl</key><true/>
+	<key>com.apple.frontboard.launchapplications</key><true/>
+	<key>com.apple.frontboard.shutdown</key><true/>
+	<key>com.apple.backboardd.launchapplications</key><true/>
+	<key>com.apple.multitasking.termination</key><true/>
+</dict>
+</plist>
