@@ -1,0 +1,510 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 554832e..ad1bbf7 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_vnet.c			standard
++bsd/dev/sweet_vinput.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_vinput.c b/bsd/dev/sweet_vinput.c
+new file mode 100644
+index 0000000..a12955a
+--- /dev/null
++++ b/bsd/dev/sweet_vinput.c
+@@ -0,0 +1,380 @@
++/*
++ * QEMU virtio-input (virtio-mmio version 2) as touch screen, buttons and keyboard.
++ *
++ * Only with sweetvinput=1: the QEMU virt machine's virtio-mmio window at
++ * 0x0a000000 is unrelated hardware on the phone. Start QEMU with
++ * "-global virtio-mmio.force-legacy=false -device virtio-tablet-device
++ * -device virtio-keyboard-device" (virtio-multitouch-device also works).
++ * Host-side input (QMP input-send-event, VNC, a GTK window) then reaches iOS
++ * without a debugger. Polled, no interrupts: a thread drains every event queue
++ * every 4 ms and feeds SweetHID (iokit/Kernel/arm/hid/SweetHID.cpp):
++ *   absolute pointer / multitouch slots -> sweet_hid_touch (1080x2400)
++ *   KEY_POWER, KEY_VOLUMEUP, KEY_VOLUMEDOWN, KEY_HOMEPAGE -> sweet_hid_key
++ *   other keys -> sweet_hid_kbd (HID keyboard usage page 7)
++ */
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/thread.h>
++#include <vm/vm_kern.h>
++#include <vm/pmap.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void IOSleep(unsigned int);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern void sweet_hid_key(int key, int down);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_hid_kbd(unsigned usage, int down);
++int sweet_vinput_start(void);
++
++#define VI_MMIO_PA      0x0a000000UL
++#define VI_MMIO_SLOT    0x200
++#define VI_MMIO_SLOTS   32
++#define VI_MAXDEV       4
++
++#define VM_MAGIC        0x000
++#define VM_VERSION      0x004
++#define VM_DEVICE       0x008
++#define VM_DEVF         0x010
++#define VM_DEVF_SEL     0x014
++#define VM_DRVF         0x020
++#define VM_DRVF_SEL     0x024
++#define VM_QSEL         0x030
++#define VM_QNUM_MAX     0x034
++#define VM_QNUM         0x038
++#define VM_QREADY       0x044
++#define VM_QNOTIFY      0x050
++#define VM_INT_STATUS   0x060
++#define VM_INT_ACK      0x064
++#define VM_STATUS       0x070
++#define VM_QDESC        0x080
++#define VM_QDRIVER      0x090
++#define VM_QDEVICE      0x0a0
++#define VM_CONFIG       0x100
++
++#define VS_ACK          1
++#define VS_DRIVER       2
++#define VS_DRIVER_OK    4
++#define VS_FEATURES_OK  8
++#define VIRTIO_F_V1     (1u << 0)       /* bit 32 */
++#define VQ_F_WRITE      2
++
++#define VI_QSZ          64
++#define VI_AVAIL        0x400
++#define VI_USED         0x800
++#define VI_BUFS         0xc00
++#define VI_PER_DEV      0x1000
++
++/* Linux input event codes (include/uapi/linux/input-event-codes.h) */
++#define EV_SYN          0
++#define EV_KEY          1
++#define EV_ABS          3
++#define ABS_X           0x00
++#define ABS_Y           0x01
++#define ABS_MT_SLOT     0x2f
++#define ABS_MT_POSITION_X 0x35
++#define ABS_MT_POSITION_Y 0x36
++#define ABS_MT_TRACKING_ID 0x39
++#define BTN_LEFT        0x110
++#define BTN_TOUCH       0x14a
++#define KEY_VOLUMEDOWN  114
++#define KEY_VOLUMEUP    115
++#define KEY_POWER       116
++#define KEY_HOMEPAGE    172
++
++#define VI_FINGERS      10
++#define VI_ABS_MAX      32768           /* QEMU reports 0..0x7fff */
++
++struct vq_desc {
++	uint64_t addr;
++	uint32_t len;
++	uint16_t flags;
++	uint16_t next;
++};
++struct vq_avail {
++	uint16_t flags;
++	uint16_t idx;
++	uint16_t ring[VI_QSZ];
++};
++struct vq_used_elem {
++	uint32_t id;
++	uint32_t len;
++};
++struct vq_used {
++	uint16_t flags;
++	uint16_t idx;
++	struct vq_used_elem ring[VI_QSZ];
++};
++struct vi_event {
++	uint16_t type;
++	uint16_t code;
++	uint32_t value;
++};
++
++struct vi_dev {
++	volatile uint8_t *regs;
++	vm_offset_t va;
++	uint64_t    pa;
++	uint16_t    seen;
++	/* pointer/multitouch state, committed on EV_SYN */
++	int         slot;
++	int         x[VI_FINGERS], y[VI_FINGERS];
++	int         down[VI_FINGERS], sent_down[VI_FINGERS];
++	int         sx[VI_FINGERS], sy[VI_FINGERS];
++	int         dirty;
++};
++
++static struct vi_dev vi[VI_MAXDEV];
++static unsigned vi_ndev;
++
++#define VI_DMB()        __asm__ volatile ("dmb sy" ::: "memory")
++
++static inline uint32_t
++vi_rd(struct vi_dev *d, uint32_t off)
++{
++	return *(volatile uint32_t *)(d->regs + off);
++}
++
++static inline void
++vi_wr(struct vi_dev *d, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(d->regs + off) = val;
++}
++
++/* Linux key code -> HID keyboard usage (page 7); 0 = unmapped. */
++static const uint8_t vi_keymap[128] = {
++	[1] = 41, [2] = 30, [3] = 31, [4] = 32, [5] = 33, [6] = 34, [7] = 35, [8] = 36,
++	[9] = 37, [10] = 38, [11] = 39, [12] = 45, [13] = 46, [14] = 42, [15] = 43,
++	[16] = 20, [17] = 26, [18] = 8, [19] = 21, [20] = 23, [21] = 28, [22] = 24,
++	[23] = 12, [24] = 18, [25] = 19, [26] = 47, [27] = 48, [28] = 40, [29] = 224,
++	[30] = 4, [31] = 22, [32] = 7, [33] = 9, [34] = 10, [35] = 11, [36] = 13,
++	[37] = 14, [38] = 15, [39] = 51, [40] = 52, [41] = 53, [42] = 225, [43] = 49,
++	[44] = 29, [45] = 27, [46] = 6, [47] = 25, [48] = 5, [49] = 17, [50] = 16,
++	[51] = 54, [52] = 55, [53] = 56, [54] = 229, [56] = 226, [57] = 44, [58] = 57,
++	[59] = 58, [60] = 59, [61] = 60, [62] = 61, [63] = 62, [64] = 63, [65] = 64,
++	[66] = 65, [67] = 66, [68] = 67, [87] = 68, [88] = 69, [96] = 88, [97] = 228,
++	[100] = 230, [102] = 74, [103] = 82, [104] = 75, [105] = 80, [106] = 79,
++	[107] = 77, [108] = 81, [109] = 78, [110] = 73, [111] = 76, [125] = 227,
++	[126] = 231,
++};
++
++static void
++vi_key(int code, int down)
++{
++	switch (code) {
++	case KEY_POWER:      sweet_hid_key(0, down); return;
++	case KEY_VOLUMEUP:   sweet_hid_key(1, down); return;
++	case KEY_VOLUMEDOWN: sweet_hid_key(2, down); return;
++	case KEY_HOMEPAGE:   sweet_hid_key(3, down); return;
++	case BTN_LEFT:
++	case BTN_TOUCH:
++		return;         /* handled by the caller */
++	}
++	if (code > 0 && code < (int)sizeof(vi_keymap) && vi_keymap[code]) {
++		sweet_hid_kbd(vi_keymap[code], down);
++	}
++}
++
++static void
++vi_sync(struct vi_dev *d)
++{
++	for (int f = 0; f < VI_FINGERS; f++) {
++		int x = (int)((int64_t)d->x[f] * 1080 / VI_ABS_MAX);
++		int y = (int)((int64_t)d->y[f] * 2400 / VI_ABS_MAX);
++		if (d->down[f] != d->sent_down[f] || (d->down[f] && (x != d->sx[f] || y != d->sy[f]))) {
++			sweet_hid_touch(f, d->down[f], x, y);
++			d->sent_down[f] = d->down[f];
++			d->sx[f] = x;
++			d->sy[f] = y;
++		}
++	}
++	d->dirty = 0;
++}
++
++static void
++vi_event(struct vi_dev *d, const struct vi_event *e)
++{
++	int s = d->slot;
++
++	switch (e->type) {
++	case EV_SYN:
++		if (d->dirty) {
++			vi_sync(d);
++		}
++		break;
++	case EV_KEY:
++		if (e->code == BTN_LEFT || e->code == BTN_TOUCH) {
++			d->down[0] = e->value != 0;
++			d->dirty = 1;
++		} else if (e->value <= 1) {     /* 2 = autorepeat */
++			vi_key(e->code, (int)e->value);
++		}
++		break;
++	case EV_ABS:
++		switch (e->code) {
++		case ABS_X:
++			d->x[0] = (int)e->value; d->dirty = 1; break;
++		case ABS_Y:
++			d->y[0] = (int)e->value; d->dirty = 1; break;
++		case ABS_MT_SLOT:
++			d->slot = (int)e->value < VI_FINGERS ? (int)e->value : 0; break;
++		case ABS_MT_TRACKING_ID:
++			d->down[s] = (int32_t)e->value >= 0; d->dirty = 1; break;
++		case ABS_MT_POSITION_X:
++			d->x[s] = (int)e->value; d->dirty = 1; break;
++		case ABS_MT_POSITION_Y:
++			d->y[s] = (int)e->value; d->dirty = 1; break;
++		}
++		break;
++	}
++}
++
++static void
++vi_poll(struct vi_dev *d)
++{
++	volatile struct vq_used *u = (volatile struct vq_used *)(d->va + VI_USED);
++	volatile struct vq_avail *a = (volatile struct vq_avail *)(d->va + VI_AVAIL);
++	int refilled = 0;
++
++	VI_DMB();
++	while (d->seen != u->idx) {
++		uint32_t id = u->ring[d->seen % VI_QSZ].id % VI_QSZ;
++		struct vi_event e = *(volatile struct vi_event *)(d->va + VI_BUFS + id * sizeof(struct vi_event));
++		vi_event(d, &e);
++		a->ring[a->idx % VI_QSZ] = (uint16_t)id;
++		VI_DMB();
++		a->idx++;
++		d->seen++;
++		refilled = 1;
++	}
++	if (refilled) {
++		VI_DMB();
++		vi_wr(d, VM_QNOTIFY, 0);
++	}
++	uint32_t isr = vi_rd(d, VM_INT_STATUS);
++	if (isr) {
++		vi_wr(d, VM_INT_ACK, isr);
++	}
++}
++
++static void
++vi_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	for (;;) {
++		for (unsigned i = 0; i < vi_ndev; i++) {
++			vi_poll(&vi[i]);
++		}
++		IOSleep(4);
++	}
++}
++
++static int
++vi_dev_init(struct vi_dev *d, unsigned slot)
++{
++	char name[40] = "";
++
++	if (vi_rd(d, VM_VERSION) != 2) {
++		printf("SWEET VINPUT: slot %u is virtio-mmio version %u (need -global virtio-mmio.force-legacy=false)\n",
++		    slot, vi_rd(d, VM_VERSION));
++		return -1;
++	}
++	vi_wr(d, VM_STATUS, 0);
++	vi_wr(d, VM_STATUS, VS_ACK);
++	vi_wr(d, VM_STATUS, VS_ACK | VS_DRIVER);
++	vi_wr(d, VM_DEVF_SEL, 1);
++	if ((vi_rd(d, VM_DEVF) & VIRTIO_F_V1) == 0) {
++		return -1;
++	}
++	vi_wr(d, VM_DRVF_SEL, 0);
++	vi_wr(d, VM_DRVF, 0);
++	vi_wr(d, VM_DRVF_SEL, 1);
++	vi_wr(d, VM_DRVF, VIRTIO_F_V1);
++	vi_wr(d, VM_STATUS, VS_ACK | VS_DRIVER | VS_FEATURES_OK);
++	if ((vi_rd(d, VM_STATUS) & VS_FEATURES_OK) == 0) {
++		return -1;
++	}
++
++	/* config select VIRTIO_INPUT_CFG_ID_NAME, for the log */
++	d->regs[VM_CONFIG + 0] = 1;
++	d->regs[VM_CONFIG + 1] = 0;
++	VI_DMB();
++	unsigned n = d->regs[VM_CONFIG + 2];
++	for (unsigned i = 0; i < n && i < sizeof(name) - 1; i++) {
++		name[i] = (char)d->regs[VM_CONFIG + 8 + i];
++	}
++
++	vi_wr(d, VM_QSEL, 0);
++	if (vi_rd(d, VM_QREADY) != 0 || vi_rd(d, VM_QNUM_MAX) < VI_QSZ) {
++		return -1;
++	}
++	volatile struct vq_desc *desc = (volatile struct vq_desc *)d->va;
++	volatile struct vq_avail *a = (volatile struct vq_avail *)(d->va + VI_AVAIL);
++	for (unsigned i = 0; i < VI_QSZ; i++) {
++		desc[i].addr = d->pa + VI_BUFS + i * sizeof(struct vi_event);
++		desc[i].len = sizeof(struct vi_event);
++		desc[i].flags = VQ_F_WRITE;
++		desc[i].next = 0;
++		a->ring[i] = (uint16_t)i;
++	}
++	VI_DMB();
++	a->idx = VI_QSZ;
++	vi_wr(d, VM_QNUM, VI_QSZ);
++	vi_wr(d, VM_QDESC, (uint32_t)d->pa);
++	vi_wr(d, VM_QDESC + 4, (uint32_t)(d->pa >> 32));
++	vi_wr(d, VM_QDRIVER, (uint32_t)(d->pa + VI_AVAIL));
++	vi_wr(d, VM_QDRIVER + 4, (uint32_t)((d->pa + VI_AVAIL) >> 32));
++	vi_wr(d, VM_QDEVICE, (uint32_t)(d->pa + VI_USED));
++	vi_wr(d, VM_QDEVICE + 4, (uint32_t)((d->pa + VI_USED) >> 32));
++	vi_wr(d, VM_QREADY, 1);
++	vi_wr(d, VM_STATUS, VS_ACK | VS_DRIVER | VS_FEATURES_OK | VS_DRIVER_OK);
++	VI_DMB();
++	vi_wr(d, VM_QNOTIFY, 0);
++	printf("SWEET VINPUT: slot %u \"%s\"\n", slot, name);
++	return 0;
++}
++
++/* Find and start every virtio-input device; called by SweetVirtioInput::start (sweetvinput=1). */
++int
++sweet_vinput_start(void)
++{
++	vm_offset_t base = ml_io_map(VI_MMIO_PA, VI_MMIO_SLOT * VI_MMIO_SLOTS);
++	vm_offset_t dma;
++
++	if (kmem_alloc_contig(kernel_map, &dma, VI_PER_DEV * VI_MAXDEV, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET VINPUT: no DMA memory\n");
++		return -1;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)dma);
++	if (!pn) {
++		return -1;
++	}
++	uint64_t dma_pa = ptoa_64(pn);
++
++	vi_ndev = 0;
++	for (unsigned slot = 0; slot < VI_MMIO_SLOTS && vi_ndev < VI_MAXDEV; slot++) {
++		volatile uint8_t *r = (volatile uint8_t *)(base + slot * VI_MMIO_SLOT);
++		if (*(volatile uint32_t *)(r + VM_MAGIC) != 0x74726976 ||
++		    *(volatile uint32_t *)(r + VM_DEVICE) != 18) {
++			continue;
++		}
++		struct vi_dev *d = &vi[vi_ndev];
++		bzero(d, sizeof(*d));
++		d->regs = r;
++		d->va = dma + vi_ndev * VI_PER_DEV;
++		d->pa = dma_pa + vi_ndev * VI_PER_DEV;
++		if (vi_dev_init(d, slot) == 0) {
++			vi_ndev++;
++		}
++	}
++	if (vi_ndev == 0) {
++		printf("SWEET VINPUT: no virtio-input device\n");
++		return -1;
++	}
++	thread_t thread;
++	if (kernel_thread_start(vi_thread, NULL, &thread) != KERN_SUCCESS) {
++		return -1;
++	}
++	thread_deallocate(thread);
++	return 0;
++}
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index d2f4fa1..8c59194 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -375,8 +375,74 @@ private:
+ };
+ OSDefineMetaClassAndStructors(SweetHIDTouch, IOHIDEventService);
+ 
++/*
++ * Hardware keyboard (QEMU virtio-keyboard via bsd/dev/sweet_vinput.c):
++ * keyboard-page key events, so text fields take typed text and the
++ * software keyboard hides like with a Bluetooth keyboard.
++ */
++class SweetHIDKeyboard : public IOHIDEventService {
++	OSDeclareDefaultStructors(SweetHIDKeyboard);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	void key(UInt32 usage, bool down);
++protected:
++	virtual UInt32 getPrimaryUsagePage() APPLE_KEXT_OVERRIDE { return kHIDPage_GenericDesktop; }
++	virtual UInt32 getPrimaryUsage() APPLE_KEXT_OVERRIDE { return kHIDUsage_GD_Keyboard; }
++	virtual UInt32 getProductID() APPLE_KEXT_OVERRIDE { return 3; }
++};
++OSDefineMetaClassAndStructors(SweetHIDKeyboard, IOHIDEventService);
++
++/* Starts the QEMU virtio-input driver (bsd/dev/sweet_vinput.c) with sweetvinput=1. */
++class SweetVirtioInput : public IOService {
++	OSDeclareDefaultStructors(SweetVirtioInput);
++public:
++	virtual bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(SweetVirtioInput, IOService);
++
+ static SweetHIDButtons *gSweetButtons;
+ static SweetHIDTouch *gSweetTouch;
++static SweetHIDKeyboard *gSweetKeyboard;
++
++extern "C" int sweet_vinput_start(void);
++
++bool
++SweetVirtioInput::start(IOService *provider)
++{
++	int on = 0;
++
++	(void)PE_parse_boot_argn("sweetvinput", &on, sizeof(on));
++	if (!on || !IOService::start(provider)) {
++		return false;
++	}
++	return sweet_vinput_start() == 0;
++}
++
++bool
++SweetHIDKeyboard::start(IOService *provider)
++{
++	int on = 0;
++
++	(void)PE_parse_boot_argn("sweetvinput", &on, sizeof(on));
++	if (!on || !IOHIDEventService::start(provider)) {
++		return false;
++	}
++	gSweetKeyboard = this;
++	registerService();
++	IOLog("SWEET HID: keyboard registered\n");
++	return true;
++}
++
++void
++SweetHIDKeyboard::key(UInt32 usage, bool down)
++{
++	IOHIDEvent *event = IOHIDEvent::keyboardEvent(mach_absolute_time(), kHIDPage_KeyboardOrKeypad, usage, down);
++
++	if (event) {
++		dispatchEvent(event);
++		event->release();
++	}
++}
+ 
+ bool
+ SweetHIDButtons::start(IOService *provider)
+@@ -559,3 +625,11 @@ sweet_hid_touch(int finger, int down, int x, int y)
+ 		gSweetTouch->touch(finger, down != 0, x, y);
+ 	}
+ }
++
++extern "C" void
++sweet_hid_kbd(unsigned usage, int down)
++{
++	if (gSweetKeyboard) {
++		gSweetKeyboard->key(usage, down != 0);
++	}
++}
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index 72b0af4..f9b49d0 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -87,6 +87,16 @@ const char * gIOKernelConfigTables =
+     "     'IOProviderClass' = IOResources;"
+     "     'IOMatchCategory' = SweetVirtioNet;"
+     "   },"
++    "   {"
++    "     'IOClass'         = SweetHIDKeyboard;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetHIDKeyboard;"
++    "   },"
++    "   {"
++    "     'IOClass'         = SweetVirtioInput;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = SweetVirtioInput;"
++    "   },"
+ #endif
+     "   {"
+     "     'IOClass'         = IOPanicPlatform;"
